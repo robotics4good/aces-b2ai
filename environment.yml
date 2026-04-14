@@ -1,0 +1,29 @@
+name: aces-b2ai
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - jupyter
+  - ipykernel
+  - pip:
+    - b2aiprep==3.1.0
+    - pandas
+    - numpy
+    - librosa
+    - parselmouth
+    - scikit-learn
+    - xgboost
+    - lightgbm
+    - torch
+    - matplotlib
+    - seaborn
+    - plotly
+    - shap
+    - scipy
+    - statsmodels
+    - datasets
+    - pyarrow
+    - fastparquet
+    - opensmile
