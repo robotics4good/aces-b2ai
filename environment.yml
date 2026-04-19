@@ -8,7 +8,8 @@ dependencies:
   - jupyter
   - ipykernel
   - pip:
-    - b2aiprep==3.1.0
+    # Team fork: https://github.com/robotics4good/b2aiprep — pin updates reproducible installs
+    - "b2aiprep @ git+https://github.com/robotics4good/b2aiprep.git@56d22b13141aee2cc4604c23e0bd84ab436a855c"
     - pandas
     - numpy
     - librosa

@@ -29,6 +29,10 @@ aces-b2ai/
 ├── data/               # LOCAL ONLY - never committed
 └── environment.yml     # Python environment
 
+## B2AI Prep (`b2aiprep`)
+
+Team fork: **[github.com/robotics4good/b2aiprep](https://github.com/robotics4good/b2aiprep)** — package source, CLI (`b2aiprep-cli`), and `external_scripts/` live there. This repo installs that code via the Git URL in `environment.yml` (commit pin; bump the hash when you intentionally move to a newer revision). After `conda activate aces-b2ai`, run `b2aiprep-cli --help`.
+
 ## Setup
 ```bash
 conda env create -f environment.yml
