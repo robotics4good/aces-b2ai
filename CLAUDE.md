@@ -6,17 +6,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **ACES Team — Bridge2AI Voice Pediatric Dataset Hackathon Project**
 
-Research Question: What acoustic features in pediatric voice recordings are associated with specific pathological conditions, and can ML models reliably identify these acoustic correlates?
+Research Question: What acoustic features in pediatric voice recordings are associated with specific pathological conditions (especially airway and breathing-related histories), and can ML models reliably identify these acoustic correlates—especially when voice is treated as a **dynamical system** across tasks and over time within a clip?
 
 Dataset: Bridge2AI-Voice Pediatric Dataset v1.0.0 (300 participants, ages 2-18, 22,620 recordings)
 
 ## Environment Setup
 
 ```bash
-# Create and activate conda environment
+# 1. Create and activate conda environment
 conda env create -f environment.yml
 conda activate aces-b2ai
+
+# 2. Install the aces_b2ai Python package (editable mode)
+pip install -e ".[dev]"
+
+# 3. Run tests to verify installation
+pytest -q
 ```
+
+The environment includes:
+- Pinned b2aiprep fork: `git+https://github.com/robotics4good/b2aiprep.git@56d22b1...`
+- `aces_b2ai` package: Secondary feature extraction pipeline
+- Test suite via pytest
 
 ## Data Access & DUA Compliance
 
@@ -32,6 +43,20 @@ conda activate aces-b2ai
 
 ```
 aces-b2ai/
+├── src/aces_b2ai/           # Python package: secondary feature extraction
+│   ├── __init__.py          # Public API exports
+│   ├── __main__.py          # CLI entry point
+│   ├── pipeline.py          # Feature extraction pipeline
+│   ├── align.py             # Time-series alignment (50Hz SPARC vs 100Hz pitch)
+│   ├── loaders.py           # Parquet/TSV reading utilities
+│   ├── config.py            # Pipeline configuration
+│   ├── context.py           # ClipContext data structure
+│   ├── tasks.py             # Task taxonomy and filtering
+│   ├── stress_labels.py     # External stress annotation support
+│   ├── core/                # Base classes and registry
+│   ├── extractors/          # Feature extractors (pitch, mel, mfcc, dynamical, crossmodal)
+│   └── INVENTORY.md         # Frame rate alignment reference
+├── tests/                   # pytest test suite
 ├── data/                    # LOCAL ONLY - participant data (never committed)
 ├── phenotype/               # JSON schemas for phenotype data
 │   ├── pediatric/          # Demographics, medical conditions schemas
@@ -40,7 +65,11 @@ aces-b2ai/
 ├── features/                # JSON schemas for audio features
 ├── docs/                    # Data access documentation
 ├── *.ipynb                  # Analysis notebooks (exploratory)
-└── environment.yml          # Python dependencies
+├── pyproject.toml           # Package metadata
+├── environment.yml          # Conda environment
+├── FEATURES.MD              # Primary feature modalities documentation
+├── BRIDGE2AI_COMBINED.MD    # Long-form reference
+└── CLAUDE.md                # This file
 ```
 
 ## Dataset Architecture
@@ -91,11 +120,24 @@ Join tables using:
 The dataset includes 19 task types across categories:
 - **Conversational Speech**: ready-for-school, favorite-show-movie-game, favorite-food, outside-of-school
 - **Word Naming/Fluency**: naming-animals, naming-food
-- **Sustained Phonation**: long-sounds (vowels)
+- **Sustained Phonation**: long-sounds (vowels) — *sustained phonation tasks tracked in `tasks.py:SUSTAINED_PHONATION_LIKE_TASKS`*
 - **Non-Speech**: silly-sounds, noisy-sounds
 - **Picture Tasks**: picture, picture-description
 - **Reading**: sentence, passage
 - **Speech Repetition**: repeat-words
+
+### Frame Rate Alignment (Critical for Multi-Modal Fusion)
+
+**See [src/aces_b2ai/INVENTORY.md](src/aces_b2ai/INVENTORY.md) for details**
+
+| Source | Rate | Notes |
+|--------|------|-------|
+| Torchaudio mel/MFCC/spectrogram | ~50 Hz | After `::2` subsampling (hop 320 @ 16kHz) |
+| Torchaudio pitch | ~100 Hz | NO subsampling — **must resample to mel grid** |
+| SPARC (pitch/periodicity/loudness) | 50 Hz | Aligned with each other |
+| PPG | 100 Hz | 40 phoneme categories |
+
+The `aces_b2ai.align` module handles resampling pitch and periodicity to a common reference length (typically mel/MFCC width).
 
 ## Working with Data
 
@@ -113,14 +155,63 @@ static_features = pd.read_csv('data/features/static_features.tsv', sep='\t')
 mel_spec = pd.read_parquet('data/features/torchaudio_mel_spectrogram.parquet')
 ```
 
+### Using the `aces_b2ai` Package for Secondary Features
+
+The `aces_b2ai` package extracts **secondary (derived) features** from primary Bridge2AI tensors:
+
+```python
+import numpy as np
+from aces_b2ai import FeatureExtractionPipeline, PipelineConfig
+
+# Load your data (example with synthetic data)
+mel = np.random.randn(60, 200).astype(np.float32)  # 60 mel bins × 200 frames
+mfcc = np.random.randn(60, 200).astype(np.float32)  # 60 coefficients × 200 frames
+pitch = np.full(200, 220.0, dtype=np.float32)  # 200 frames (will be resampled if needed)
+
+# Create pipeline
+pipe = FeatureExtractionPipeline()
+
+# Extract features
+result = pipe.extract(
+    participant_id="458172",
+    session_id="c6030d0b",
+    task_name="long-sounds",
+    mel=mel,
+    mfcc=mfcc,
+    pitch=pitch,
+)
+
+# Access secondary features (dict of scalars)
+print(result.features.keys())
+# Example keys: 'pitch_f0_mean_hz_masked', 'mel_energy_depletion_ratio',
+#               'mfcc_delta_coeff0_abs_mean', 'cross_mfcc0_f0_coupling_pearson'
+```
+
+**CLI batch processing:**
+```bash
+python -m aces_b2ai \
+  --mel-parquet data/features/torchaudio_mel_spectrogram.parquet \
+  --mfcc-parquet data/features/torchaudio_mfcc.parquet \
+  --pitch-parquet data/features/torchaudio_pitch.parquet \
+  --output-csv results/secondary_features.csv \
+  --sustained-phonation-only  # Optional: filter to sustained tasks only
+```
+
+**Enabling dynamical features** (phase portraits, sample entropy, Takens embedding):
+```python
+cfg = PipelineConfig(enable_dynamical=True, dynamical_min_voiced_frames=20)
+pipe = FeatureExtractionPipeline(cfg=cfg)
+```
+
 ### Key Python Libraries
 
 Per [environment.yml](environment.yml):
-- **Data**: pandas, numpy, pyarrow, fastparquet
-- **Audio**: librosa, parselmouth, opensmile, b2aiprep==3.1.0
+- **Package dependencies** (via pyproject.toml): numpy, pandas, pyarrow, scipy
+- **Audio**: librosa, parselmouth, opensmile, b2aiprep (pinned Git fork)
 - **ML**: scikit-learn, xgboost, lightgbm, torch
 - **Visualization**: matplotlib, seaborn, plotly
 - **Interpretability**: shap
+- **Testing**: pytest (dev dependency)
 
 ### Important Data Notes
 
@@ -128,6 +219,7 @@ Per [environment.yml](environment.yml):
 2. **Missing Data**: Features may contain NaN when audio quality is insufficient or task was incomplete
 3. **Multi-select Fields**: Medical conditions use comma-separated values (e.g., `peds_mc_breathing_conditions`)
 4. **Sampling Rates**: SPARC features @ 50Hz, PPGs @ 100Hz, TorchAudio spectral (post-subsample) @ 50Hz
+5. **Voicing Mask**: Pipeline uses SPARC periodicity (if available) or pitch bounds to create voiced/unvoiced masks
 
 ## Development Workflow
 
@@ -155,13 +247,35 @@ From exploratory analysis, high-prevalence conditions include:
 
 ### Typical Analysis Pattern
 
+**Option 1: Using Pre-extracted Features (Static + Secondary)**
 1. Load demographics and medical conditions
-2. Load relevant feature set(s) based on research question
-3. Join tables on `participant_id` and `session_id`
-4. Filter for specific tasks or conditions
-5. Extract acoustic features
-6. Train/evaluate ML models
-7. Generate interpretability analyses (SHAP)
+2. Load static features TSV and/or secondary features CSV (from CLI pipeline)
+3. Join tables on `participant_id`, `session_id`, `task_name`
+4. Filter for specific medical conditions or task types
+5. Train/evaluate ML models
+6. Generate interpretability analyses (SHAP)
+
+**Option 2: Custom Feature Extraction**
+1. Load primary features (mel, MFCC, pitch) from Parquet files
+2. Use `aces_b2ai.FeatureExtractionPipeline` to compute secondary features
+3. Combine with phenotype data
+4. Filter and analyze
+
+**Option 3: Task-Specific Analysis**
+```python
+from aces_b2ai import filter_rows_by_tasks, is_sustained_phonation_task
+
+# Filter to sustained phonation tasks only
+sustained_rows = filter_rows_by_tasks(
+    all_rows,
+    sustained_phonation_only=True
+)
+
+# Or check individual tasks
+if is_sustained_phonation_task("long-sounds"):
+    # Analyze sustained phonation metrics
+    pass
+```
 
 ## Important Considerations
 
@@ -179,8 +293,48 @@ Bensoussan Y, et al. (2025). Bridge2AI-Voice Pediatric Dataset (version 1.0.0).
 PhysioNet. DOI: 10.13026/y7mp-eh56
 ```
 
+## Package API Reference
+
+**Key Modules** (see [README.md](README.md) for full API documentation):
+- `pipeline.py` — `FeatureExtractionPipeline`, `default_registry()`
+- `align.py` — Time-series resampling, voicing mask creation
+- `config.py` — `PipelineConfig`, `VoicingConfig`, `TorchaudioFeatureConfig`
+- `context.py` — `ClipContext` data structure
+- `tasks.py` — `SUSTAINED_PHONATION_LIKE_TASKS`, task filtering
+- `loaders.py` — Parquet/TSV reading utilities
+- `extractors/` — Individual feature extractors:
+  - `pitch_secondary.py` — F0 depletion, voiced runs, entropy
+  - `mel_secondary.py` — Energy depletion, modulation bands
+  - `mfcc_secondary.py` — Delta statistics, autocorrelation
+  - `crossmodal.py` — Inter-feature correlations
+  - `dynamical.py` — Sample entropy, phase portraits (optional)
+
+**Test Coverage:**
+```bash
+pytest -v  # Run all tests with verbose output
+pytest tests/test_pipeline_synthetic.py -v  # Run specific test file
+```
+
 ## Documentation References
 
-- Dataset documentation: [features/features.md](features/features.md)
-- Data access: [docs/data_access.md](docs/data_access.md)
-- PhysioNet page: https://physionet.org/content/b2ai-voice-pediatric/1.0.0/
+- **Primary features**: [FEATURES.MD](FEATURES.MD) — Authoritative breakdown of all feature modalities
+- **Long-form reference**: [BRIDGE2AI_COMBINED.MD](BRIDGE2AI_COMBINED.MD) — Phenotype joins, breathing EDA, signal processing
+- **Frame rates**: [src/aces_b2ai/INVENTORY.md](src/aces_b2ai/INVENTORY.md) — Critical alignment table
+- **Dataset documentation**: [features/features.md](features/features.md) — Original feature schemas
+- **Data access**: [docs/data_access.md](docs/data_access.md)
+- **PhysioNet page**: https://physionet.org/content/b2ai-voice-pediatric/1.0.0/
+- **Package README**: [README.md](README.md) — Complete usage guide and API reference
+
+## Secondary Features Overview
+
+The `aces_b2ai` package computes these secondary feature categories:
+
+| Category | Example Features | Clinical Relevance |
+|----------|------------------|-------------------|
+| **Pitch/F0** | `pitch_f0_mean_hz_masked`, `pitch_depletion_slope_hz_per_frame`, `pitch_voiced_run_count` | Breath support, laryngeal stability, phonation breaks |
+| **Mel Energy** | `mel_energy_depletion_ratio`, `mel_phonation_stability_cv`, `mel_mod_band_*` | Broadband noise, instability proxies |
+| **MFCC Dynamics** | `mfcc_delta_coeff0_abs_mean`, `mfcc_segment_drift_l2_c0_3` | Spectral drift vs rapid fluctuation |
+| **Cross-modal** | `cross_mfcc0_f0_coupling_pearson` | Envelope-pitch coupling |
+| **Dynamical** (opt) | `dyn_phase_hull_area`, `dyn_pitch_sample_entropy_m2` | Trajectory complexity, system-level analysis |
+
+See [README.md](README.md) Module Reference section for complete feature key lists.
