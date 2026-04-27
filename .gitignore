@@ -9,6 +9,8 @@
 # Never commit participant data
 # ======================
 data/
+features/
+phenotype/
 *.parquet
 *.wav
 *.mp3
