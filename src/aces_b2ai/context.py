@@ -20,6 +20,8 @@ class ClipContext:
     pitch_torch: np.ndarray | None = None  # (T_p,) Hz torchaudio
     periodicity_sparc: np.ndarray | None = None  # (T_s,) [0,1]
     pitch_sparc: np.ndarray | None = None  # (T_s,) Hz optional
+    ema_sparc: np.ndarray | None = None  # (T_ema, 12), 50 Hz, z-scored normalized units
+    loudness_sparc: np.ndarray | None = None  # (T_loud,) 50 Hz, z-scored amplitude
 
     static_features: dict[str, float] = field(default_factory=dict)
 

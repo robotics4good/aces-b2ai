@@ -10,6 +10,7 @@ from aces_b2ai.config import PipelineConfig
 from aces_b2ai.context import ClipContext
 from aces_b2ai.core.base import ExtractionResult
 from aces_b2ai.core.registry import ExtractorRegistry
+from aces_b2ai.extractors.articulatory_smoothness import ArticulatorySmoothnessExtractor
 from aces_b2ai.extractors.crossmodal import CrossmodalExtractor
 from aces_b2ai.extractors.dynamical import DynamicalExtractor
 from aces_b2ai.extractors.mel_secondary import MelSecondaryExtractor
@@ -29,6 +30,8 @@ def default_registry(cfg: PipelineConfig) -> ExtractorRegistry:
     )
     if cfg.enable_dynamical:
         reg.register(DynamicalExtractor(min_voiced_frames=cfg.dynamical_min_voiced_frames))
+    if cfg.enable_articulatory:
+        reg.register(ArticulatorySmoothnessExtractor(cfg=cfg.articulatory))
     return reg
 
 
@@ -55,6 +58,8 @@ class FeatureExtractionPipeline:
         pitch: np.ndarray | list | None = None,
         periodicity_sparc: np.ndarray | list | None = None,
         pitch_sparc: np.ndarray | list | None = None,
+        ema_sparc: np.ndarray | list | None = None,
+        loudness_sparc: np.ndarray | list | None = None,
         static_features: dict[str, float] | None = None,
         age_years: float | None = None,
         sex: str | None = None,
@@ -70,6 +75,12 @@ class FeatureExtractionPipeline:
                 return None
             return np.asarray(x, dtype=np.float64).ravel()
 
+        def _arr2d_or_none(x):
+            if x is None:
+                return None
+            a = np.asarray(x, dtype=np.float64)
+            return a if a.ndim == 2 else None
+
         ctx = ClipContext(
             participant_id=str(participant_id),
             session_id=str(session_id),
@@ -80,6 +91,8 @@ class FeatureExtractionPipeline:
             pitch_torch=_arr1d(pitch),
             periodicity_sparc=_arr1d(periodicity_sparc),
             pitch_sparc=_arr1d(pitch_sparc),
+            ema_sparc=_arr2d_or_none(ema_sparc),
+            loudness_sparc=_arr1d(loudness_sparc),
             static_features=dict(static_features or {}),
             age_years=age_years,
             sex=sex,
@@ -91,6 +104,55 @@ class FeatureExtractionPipeline:
         if provenance:
             meta["provenance"] = provenance
         return ExtractionResult(features=out.features, metadata=meta, warnings=out.warnings)
+
+    @staticmethod
+    def from_sparc_ema_parquet_row(
+        row: dict[str, Any],
+        *,
+        cfg: PipelineConfig | None = None,
+        ema_key: str = "ema",
+        loudness_key: str = "loudness",
+        periodicity_key: str = "periodicity",
+        pitch_key: str = "pitch",
+    ) -> ExtractionResult:
+        """Extract articulatory smoothness features from a sparc_ema parquet row.
+
+        Accepts a dict representing one row from sparc_ema.parquet (and
+        optionally joined columns from sparc_loudness / sparc_periodicity /
+        sparc_pitch). Only the articulatory extractor is registered; other
+        extractors that require Torchaudio tensors are skipped.
+
+        Parameters
+        ----------
+        row : dict
+            Row dict with keys participant_id, session_id, task_name, and the
+            tensor columns listed above.
+        cfg : PipelineConfig, optional
+            Must have enable_articulatory=True to produce any features.
+        ema_key, loudness_key, periodicity_key, pitch_key : str
+            Column names for each tensor in the row dict.
+        """
+        ema_raw = row.get(ema_key)
+        loudness_raw = row.get(loudness_key)
+        periodicity_raw = row.get(periodicity_key)
+        pitch_raw = row.get(pitch_key)
+
+        ema_a = parquet_row_to_numpy_2d(ema_raw) if ema_raw is not None else None
+        loudness_a = parquet_row_to_numpy_1d(loudness_raw) if loudness_raw is not None else None
+        periodicity_a = parquet_row_to_numpy_1d(periodicity_raw) if periodicity_raw is not None else None
+        pitch_a = parquet_row_to_numpy_1d(pitch_raw) if pitch_raw is not None else None
+
+        pipe = FeatureExtractionPipeline(cfg=cfg)
+        return pipe.extract(
+            participant_id=str(row["participant_id"]),
+            session_id=str(row["session_id"]),
+            task_name=str(row["task_name"]),
+            ema_sparc=ema_a,
+            loudness_sparc=loudness_a,
+            periodicity_sparc=periodicity_a,
+            pitch_sparc=pitch_a,
+            provenance={"source": "sparc_ema_parquet_row"},
+        )
 
     @staticmethod
     def from_torchaudio_parquet_row(
