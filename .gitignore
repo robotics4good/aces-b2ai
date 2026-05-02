@@ -42,7 +42,12 @@ env/
 # ======================
 .ipynb_checkpoints/
 *.ipynb_chec
+entropy_flow/entropy.ipynb
 
+# ======================
+# MACOS
+# ======================
+.DS_Store
 
 .gitignore
 bridge2ai-voice-pediatric-dataset-1.0.0
