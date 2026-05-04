@@ -128,25 +128,34 @@ class MelSPARCAugmentation(nn.Module):
 
 
 class SparseConditionedLayer(nn.Module):
-    """Single cross-attention block that injects utterance-level scalars.
+    """FiLM conditioning: inject utterance-level scalars into frame representations.
 
-    The encoder hidden states (query) attend to the sparse conditioning vector
-    (key/value), allowing global clinical features such as jerk, F0, and HNR
-    to modulate every frame's representation.
+    Uses Feature-wise Linear Modulation (scale + shift) rather than full
+    MultiheadAttention.  With kv_len=1 (a single conditioning token), MHA
+    reduces to a weighted projection anyway, but costs 4×embed_dim² ≈ 2.36M
+    params for embed_dim=768 — far too many for small clinical datasets (<200
+    clips).  FiLM achieves the same representational effect with only
+    2 × sparse_dim × embed_dim ≈ 10K params.
 
-    Uses vanilla ``nn.MultiheadAttention`` — NOT the vendored fairseq version —
-    so this layer has no dependency on the MelHuBERT vendor code.
+    Mechanism
+    ---------
+    scale, shift = Linear(sparse_dim → embed_dim) each
+    out = LayerNorm(hidden * (1 + scale) + shift)
+
+    The ``(1 + scale)`` formulation initialises close to identity
+    (scale ≈ 0 at init) so the residual stream starts undisturbed.
     """
 
-    def __init__(self, embed_dim: int, sparse_dim: int, n_heads: int = 8) -> None:
+    def __init__(self, embed_dim: int, sparse_dim: int, n_heads: int = 8) -> None:  # n_heads kept for API compat
         super().__init__()
-        self.proj = nn.Linear(sparse_dim, embed_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=n_heads,
-            batch_first=True,
-        )
+        self.scale_proj = nn.Linear(sparse_dim, embed_dim)
+        self.shift_proj = nn.Linear(sparse_dim, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
+        # Initialise close to identity: scale≈0, shift≈0
+        nn.init.zeros_(self.scale_proj.weight)
+        nn.init.zeros_(self.scale_proj.bias)
+        nn.init.zeros_(self.shift_proj.weight)
+        nn.init.zeros_(self.shift_proj.bias)
 
     def forward(
         self, hidden: torch.Tensor, sparse_vec: torch.Tensor
@@ -161,9 +170,11 @@ class SparseConditionedLayer(nn.Module):
         -------
         (B, T, embed_dim) — conditioned hidden states
         """
-        kv = self.proj(sparse_vec).unsqueeze(1)          # (B, 1, embed_dim)
-        attn_out, _ = self.cross_attn(hidden, kv, kv)   # (B, T, embed_dim)
-        return self.norm(hidden + attn_out)
+        # Guard: replace any NaN/Inf that survived data loading
+        sparse_vec = torch.nan_to_num(sparse_vec, nan=0.0, posinf=5.0, neginf=-5.0)
+        scale = self.scale_proj(sparse_vec).unsqueeze(1)   # (B, 1, embed_dim)
+        shift = self.shift_proj(sparse_vec).unsqueeze(1)   # (B, 1, embed_dim)
+        return self.norm(hidden * (1.0 + scale) + shift)
 
 
 class TransformerBranch(nn.Module):
@@ -310,14 +321,25 @@ class TransformerBranch(nn.Module):
             # Force backbone to skip pre_extract_proj so SPARC path works
             upstream_cfg["feat_emb_dim"] = self.cfg.embed_dim
 
-        model_cfg = MelHuBERTConfig(upstream_cfg)
-        self.backbone = MelHuBERTModel(model_cfg)
+        # Capture current device before we replace self.backbone.
+        # load_pretrained may be called after model.to(device), so the old
+        # backbone is already on the target device.  The new MelHuBERTModel()
+        # is always CPU-allocated; we must move it back afterwards.
+        try:
+            target_device = next(self.backbone.parameters()).device
+        except StopIteration:
+            target_device = torch.device("cpu")
 
-        missing, unexpected = self.backbone.load_state_dict(
-            all_states["model"], strict=self._load_strict
-        ) if self._load_strict else (
-            lambda res: (res.missing_keys, res.unexpected_keys)
-        )(self.backbone.load_state_dict(all_states["model"], strict=False))
+        model_cfg = MelHuBERTConfig(upstream_cfg)
+        new_backbone = MelHuBERTModel(model_cfg)
+
+        if self._load_strict:
+            missing, unexpected = new_backbone.load_state_dict(
+                all_states["model"], strict=True
+            )
+        else:
+            res = new_backbone.load_state_dict(all_states["model"], strict=False)
+            missing, unexpected = res.missing_keys, res.unexpected_keys
 
         if not self._load_strict and missing:
             # Only pre_extract_proj keys are expected to be missing
@@ -327,12 +349,15 @@ class TransformerBranch(nn.Module):
                     f"Unexpected missing keys when loading checkpoint: {unexpected_missing}"
                 )
 
+        # Move to the same device as the rest of the model before assigning
+        self.backbone = new_backbone.to(target_device)
+
         # Update layer_weights size if using weighted_sum pool and
         # the checkpoint has a different layer count than n_encoder_layers
         n_layers = model_cfg.encoder_layers
         if self.layer_weights is not None and len(self.layer_weights) != n_layers:
             self.layer_weights = nn.Parameter(
-                torch.ones(n_layers) / n_layers
+                torch.ones(n_layers, device=target_device) / n_layers
             )
 
         if self.cfg.freeze_encoder:
@@ -343,24 +368,55 @@ class TransformerBranch(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad_(False)
 
-    def unfreeze_encoder(self) -> None:
-        """Unfreeze all MelHuBERT backbone parameters for full fine-tuning."""
+    def unfreeze_encoder(self, top_n: int | None = None) -> None:
+        """Unfreeze MelHuBERT backbone parameters.
+
+        Parameters
+        ----------
+        top_n : int | None
+            If None, unfreeze all 12 layers (risky with small data).
+            If set, unfreeze only the last *top_n* transformer layers plus the
+            final layer norm — keeps early layers frozen to preserve low-level
+            speech features learned on adult data, while adapting the top layers
+            to pediatric / pathological speech.
+
+            Recommended for small datasets (<500 clips): top_n=2 or top_n=3.
+        """
+        if top_n is None:
+            for p in self.backbone.parameters():
+                p.requires_grad_(True)
+            return
+
+        # Always freeze everything first, then selectively unfreeze
         for p in self.backbone.parameters():
-            p.requires_grad_(True)
+            p.requires_grad_(False)
+
+        encoder = self.backbone.encoder  # TransformerEncoder
+        n_layers = len(encoder.layers)
+        for layer in encoder.layers[n_layers - top_n:]:
+            for p in layer.parameters():
+                p.requires_grad_(True)
+
+        # Also unfreeze the final layer norm
+        if hasattr(encoder, "layer_norm") and encoder.layer_norm is not None:
+            for p in encoder.layer_norm.parameters():
+                p.requires_grad_(True)
 
     def get_param_groups(self) -> list[dict]:
         """Return optimizer param groups with per-component LR scaling.
 
-        Encoder params get 0.1× to prevent catastrophic forgetting.
-        All other params (input_proj, sparse_cond, layer_weights) get 1.0×.
+        Unfrozen encoder params get 0.1× LR to prevent catastrophic forgetting
+        of the adult-speech representations.  All other params (FiLM conditioning,
+        head) get 1.0×.
         """
-        encoder_params = list(self.backbone.parameters())
+        encoder_params = [p for p in self.backbone.parameters() if p.requires_grad]
         encoder_ids = {id(p) for p in encoder_params}
-        other_params = [p for p in self.parameters() if id(p) not in encoder_ids]
-        return [
-            {"params": encoder_params, "lr_scale": 0.1},
-            {"params": other_params, "lr_scale": 1.0},
-        ]
+        other_params = [p for p in self.parameters()
+                        if p.requires_grad and id(p) not in encoder_ids]
+        groups = [{"params": other_params, "lr_scale": 1.0}]
+        if encoder_params:
+            groups.append({"params": encoder_params, "lr_scale": 0.1})
+        return groups
 
     def forward(
         self,

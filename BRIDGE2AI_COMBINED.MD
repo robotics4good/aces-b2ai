@@ -33,6 +33,20 @@ It also integrates a full **signal processing and acoustic feature engineering c
 21. [Feature priority ranking for pediatric respiratory modeling](#21-feature-priority-ranking-for-pediatric-respiratory-modeling)
 22. [Secondary feature library: architecture and implementation plan](#22-secondary-feature-library-architecture-and-implementation-plan)
 23. [Critical technical considerations](#23-critical-technical-considerations)
+24. [MelHuBERT TransformerBranch](#section-24--melhubert-transformerbranch)
+    - [24.1 Vendored source](#241-vendored-source)
+    - [24.2 Checkpoint + distribution shift](#242-checkpoint)
+    - [24.3 Mel 60→80 bin zero-padding](#243-mel-spectrogram-input-60-bin--80-bin-zero-padding)
+    - [24.4 SPARC augmentation two-mode design](#244-sparc-augmentation-two-mode-design)
+    - [24.5 FiLM conditioning (why not MHA)](#245-static-feature-conditioning-film-not-mha)
+    - [24.6 Default sparse keys](#246-default-sparse-conditioning-keys)
+    - [24.7 Data splitting strategy](#247-data-splitting-strategy)
+    - [24.8 Class imbalance pos_weight](#248-class-imbalance-pos_weight)
+    - [24.9 Progressive encoder unfreezing](#249-progressive-encoder-unfreezing)
+    - [24.10 load_pretrained device safety](#2410-load_pretrained-device-safety)
+    - [24.11 TransformerBranchConfig reference](#2411-transformerbranchconfig-quick-reference)
+    - [24.12 Training CLI reference](#2412-training-cli-reference)
+    - [24.13 Known pitfalls](#2413-known-pitfalls-all-addressed)
 
 ---
 
@@ -1082,18 +1096,20 @@ From analysis outputs, known confounds to control in formal models:
 
 ## Section 24 — MelHuBERT TransformerBranch
 
-### Vendored source
+This section documents the full architecture and all design decisions for the
+`TransformerBranch` pipeline used in `scripts/train_binary_classifier.py`.
+
+---
+
+### 24.1 Vendored source
 
 The MelHuBERT model source is vendored at:
 
     src/aces_b2ai/models/melhubert_vendor/
 
-This folder contains `model.py`, `module.py`, `fairseq_code/`, and `pytorch_code/`
-copied from [nervjack2/MelHuBERT](https://github.com/nervjack2/MelHuBERT) (ASRU 2023, MIT License).
-The only modifications are import-path fixes (bare module names → relative imports) so the
-sub-package works inside `aces_b2ai`.
-
-Import paths:
+Contains `model.py`, `module.py`, `fairseq_code/`, and `pytorch_code/` copied from
+[nervjack2/MelHuBERT](https://github.com/nervjack2/MelHuBERT) (ASRU 2023, MIT License).
+The only modifications are import-path fixes (bare module names → relative imports).
 
 ```python
 from aces_b2ai.models.melhubert_vendor import MelHuBERTModel, MelHuBERTConfig
@@ -1101,21 +1117,37 @@ from aces_b2ai.models.branches import TransformerBranch
 from aces_b2ai.models.model_config import TransformerBranchConfig
 ```
 
-### Checkpoint
+---
 
-The pretrained checkpoint is stored at `weights/melhubert-20ms-stg2.ckpt` (1.0 GB, gitignored).
-It was inspected at plan time and has the following properties:
+### 24.2 Checkpoint
+
+Stored at `weights/melhubert-20ms-stg2.ckpt` (1.08 GB, gitignored via `weights/*.ckpt`).
 
 | Property | Value |
 |---|---|
-| Training step | 582,000 (stage 2, fully trained) |
-| `feat_emb_dim` | 80 (two 40-bin fbank frames stacked, 20 ms period) |
+| Training step | 582,000 (stage 2, fully converged) |
+| `feat_emb_dim` | 80 (two stacked 40-bin fbank frames, 20 ms period) |
 | `encoder_layers` | 12 |
 | `encoder_embed_dim` | 768 |
 | `encoder_attention_heads` | 12 |
 | State dict tensors | 201 |
+| Pretraining corpus | LibriSpeech 360h — **adult read speech** |
 
-Additional pretrained checkpoints from the original repo:
+**Distribution shift warning:** The checkpoint was trained on clean adult English read speech.
+Our data is pediatric clinical speech with voice and hearing disorders. Key mismatches:
+
+| Axis | LibriSpeech (pretraining) | Our data |
+|---|---|---|
+| Age | Adults | Children |
+| F0 range | ~80–200 Hz | ~200–500 Hz (kids ~2× higher) |
+| Vocal tract | Adult-length | Shorter → shifted formants |
+| Task | Read speech | Sustained vowels, clinical tasks |
+| Condition | Healthy | Cochlear implant, voice disorder, etc. |
+
+Despite this, frozen-encoder probing achieves val AUC ~0.85 on hearing_cochlear — the general
+spectral shape representations transfer. Fine-tuning top encoder layers pushes further.
+
+Additional available checkpoints:
 
 | Name | `feat_emb_dim` | Link |
 |---|---|---|
@@ -1124,92 +1156,297 @@ Additional pretrained checkpoints from the original repo:
 | MelHuBERT-20ms 960h stage 2 | 80 | https://drive.google.com/file/d/1Fn_C5VoH5iV3LdvBEjvfAsbMPhWFFPdd/view |
 | MelHuBERT-10ms 960h stage 2 | 40 | https://drive.google.com/file/d/18u2u-528uDh5T7R1bp1wvWJ2ygcrNlzx/view |
 
-### SPARC augmentation failure mode and fix
+---
 
-The checkpoint's `pre_extract_proj` maps exactly `80 → 768`.  Adding EMA position
-channels changes the input to `80+S`, which breaks `load_state_dict(strict=True)`.
+### 24.3 Mel spectrogram input: 60-bin → 80-bin zero-padding
 
-**Two-mode design** (controlled by `sparc_channels`):
+The dataset's `torchaudio_mel_spectrogram.parquet` stores 60-bin spectrograms.
+MelHuBERT's `pre_extract_proj` expects exactly 80 bins (two stacked 40-bin fbank frames).
+
+**Fix:** zero-pad the frequency axis:
+
+```python
+mel_80 = np.zeros((80, T), dtype=np.float32)
+mel_80[:60, :] = mel_60           # bins 60–79 stay zero
+```
+
+This is done in `load_mel_features()` in `train_binary_classifier.py`. The upper 20 bins
+are always zero — they represent frequencies above the dataset's fbank ceiling. The pretrained
+`pre_extract_proj` Linear layer was trained on 80-bin input, so it handles the zero padding
+gracefully (those weights simply receive zero input).
+
+---
+
+### 24.4 SPARC augmentation: two-mode design
+
+The checkpoint's `pre_extract_proj` maps exactly `80 → 768`. Concatenating EMA position
+channels changes the input to `80+S`, breaking `load_state_dict(strict=True)`.
+
+**Two-mode design** (controlled by `sparc_channels` in `TransformerBranchConfig`):
 
 | Mode | `sparc_channels` | Backbone `feat_emb_dim` | `pre_extract_proj` | Load mode |
 |---|---|---|---|---|
-| Clean | 0 | 80 (matches ckpt) | `Linear(80→768)` from ckpt | `strict=True` |
-| SPARC-augmented | >0 | 768 (= embed_dim) | `None` (skipped by backbone) | `strict=False` |
+| Clean mel only | 0 | 80 (matches ckpt) | `Linear(80→768)` loaded from ckpt | `strict=True` |
+| SPARC-augmented | >0 | 768 (= `embed_dim`) | `None` (backbone skips it) | `strict=False` |
 
-In the SPARC-augmented mode, `TransformerBranch.input_proj = Linear(80+S → 768)` is added
-externally and trained from scratch.  On load, `pre_extract_proj.*` (2 tensors) are silently
-skipped; all 12 encoder transformer layers load correctly (199/201 tensors).
+In SPARC mode, `TransformerBranch.input_proj = Linear(80+S → 768)` is trained from scratch.
+On load, `pre_extract_proj.*` (2 tensors) are silently skipped; all 12 transformer encoder
+layers load correctly (199/201 tensors).
 
-**Use EMA positions, not jerk time-series, for SPARC augmentation.**  Jerk is the 3rd
-derivative of EMA position; each differentiation amplifies noise.  At 50 Hz the SNR of raw
-jerk is too low for frame-level augmentation.  Instead:
+**Use EMA positions, not jerk time-series.** Jerk is the 3rd derivative of position — each
+differentiation amplifies high-frequency noise. At 50 Hz the SNR is too low for frame-level
+features. Jerk scalars belong in `sparse_keys` for utterance-level conditioning instead.
 
-- `sparc_channels=12` — EMA position channels (smooth, clinically meaningful)
-- `sparse_keys=["jerk_tbx", "jerk_tby", ...]` — jerk *scalars* via cross-attention conditioning
+---
 
-### `TransformerBranchConfig` quick reference
+### 24.5 Static feature conditioning: FiLM (not MHA)
+
+Utterance-level scalar features (HNR, F0, speaking rate, etc.) are injected into the encoder
+hidden states via a `SparseConditionedLayer`. We use **FiLM (Feature-wise Linear Modulation)**
+rather than `MultiheadAttention`.
+
+**Why not MHA?**
+
+With a single conditioning token (`kv_len=1`), MHA reduces to a weighted projection:
+
+```
+softmax(q · k^T / sqrt(d)) · v   where kv_len=1
+→ just v weighted by a scalar attention score
+→ equivalent to a learned linear combination of v
+```
+
+But `nn.MultiheadAttention(embed_dim=768, num_heads=12)` costs `4 × 768² ≈ 2.36M` parameters
+regardless of how many tokens you attend over. With 91–200 training clips, this causes
+immediate memorisation.
+
+**FiLM uses `~10K` parameters for the same representational power:**
+
+```
+scale = Linear(sparse_dim → 768)    # ~5K params
+shift = Linear(sparse_dim → 768)    # ~5K params
+out   = LayerNorm(hidden × (1 + scale) + shift)
+```
+
+The `(1 + scale)` formulation initialises close to identity (weights zeroed at init) so the
+residual stream is undisturbed at the start of training. The network learns to selectively
+amplify or suppress encoder dimensions based on utterance-level acoustic statistics.
+
+**Empirical result:** switching from MHA (2.37M trainable params) to FiLM (14,593 trainable
+params) eliminated NaN loss and raised best val AUC from 0.43 (collapsed) to 0.85.
+
+---
+
+### 24.6 Default sparse conditioning keys
+
+When `--feature-mode melhubert` is used without `--sparse-keys`, these 7 OpenSMILE
+eGeMAPSv02 features are used automatically (from `static_features.tsv`):
+
+| Key | What it captures | Clinical relevance |
+|---|---|---|
+| `HNRdBACF_sma3nz_stddevNorm` | HNR variability | Irregular voicing quality |
+| `speaking_rate` | Syllables/voiced segs per sec | Fluency, motor control |
+| `jitterLocal_sma3nz_stddevNorm` | F0 perturbation variability | Laryngeal stability |
+| `F0semitoneFrom27.5Hz_sma3nz_amean` | Mean fundamental frequency | Pitch (child range) |
+| `loudness_sma3_amean` | Mean perceived loudness | Respiratory support |
+| `alphaRatioV_sma3nz_amean` | Voiced spectral tilt | Breathiness indicator |
+| `VoicedSegmentsPerSec` | Voicing density | Connected speech timing |
+
+These were selected by first-layer weight magnitude from a trained `BinaryMLP` on the same
+task. To disable conditioning entirely: `--sparse-keys ''`.
+
+**NaN guard:** `speaking_rate` has 4 missing rows in the dataset. The loading code uses
+`pd.isna()` (not `v or 0.0` which passes NaN through since `nan` is truthy in Python).
+`SparseConditionedLayer.forward` also applies `torch.nan_to_num` as a last-resort guard.
+All values are z-scored on train-set statistics then clamped to `[-5, 5]` before the model.
+
+---
+
+### 24.7 Data splitting strategy
+
+Splits are **participant-stratified**, not clip-stratified. A participant's clips must not
+appear in both train and validation — otherwise the model can memorize speaker identity
+rather than condition.
+
+```
+pos_pids = all participants with label=1  (shuffled)
+neg_pids = all participants with label=0  (shuffled)
+
+val_pids  = first val_frac of each       (default 20%)
+train_pids = remainder
+```
+
+**Illness-at-recording confound:** participants who were acutely ill at the time of recording
+have contaminated acoustic features (nasal congestion, changed respiratory patterns). These
+are excluded with `--exclude-ill`, which filters on `peds_mc_l2w` in the phenotype data.
+Failing to exclude them leaks condition-unrelated illness signal into training.
+
+**Negative class options:**
+
+| `--negative-class` | Who is in the negative class |
+|---|---|
+| `all` | All participants without the target condition |
+| `healthy_only` | Only participants with no clinical flags in any category |
+
+`healthy_only` produces a cleaner binary contrast but reduces N. For rare conditions with
+few positives, `all` is preferred (larger negative pool, better-calibrated pos_weight).
+
+---
+
+### 24.8 Class imbalance: `pos_weight`
+
+Binary cross-entropy loss is reweighted by:
+
+```
+pos_weight = n_neg_train / n_pos_train
+```
+
+This is passed to `F.binary_cross_entropy_with_logits(pos_weight=...)` so the loss gradient
+from each positive sample is up-weighted to compensate for imbalance. For `hearing_cochlear`
+with `healthy_only`, this is ~1.94 (31 pos, 60 neg in train).
+
+---
+
+### 24.9 Progressive encoder unfreezing
+
+The MelHuBERT encoder has ~85M parameters. With small datasets (<500 clips), unfreezing
+all layers catastrophically overrides the adult-speech representations.
+
+**Strategy: freeze-then-partially-thaw**
+
+1. Train with frozen encoder for `--unfreeze-after` epochs (head + FiLM only).
+2. At that epoch, unfreeze only the top `--unfreeze-top-n` transformer layers.
+3. The unfrozen encoder parameters receive `0.1×` base LR (handled via `get_param_groups()`).
+4. The optimizer is **rebuilt** at unfreeze time so the new parameters are properly registered.
+
+**Why rebuild the optimizer?** AdamW maintains per-parameter momentum state. If you simply
+`.requires_grad_(True)` on frozen params, they exist in the model graph but not in the
+optimizer's param groups — their gradients accumulate but no update is applied. Rebuilding
+the optimizer at unfreeze time ensures a clean start for the thawed parameters.
+
+**Recommended settings by dataset size:**
+
+| Clips | `--unfreeze-top-n` | `--lr` (encoder) | Notes |
+|---|---|---|---|
+| < 200 | 2 | 1e-5 | Only last 2 layers + LayerNorm |
+| 200–500 | 3 | 1e-5 | Safe for cluster runs |
+| 500–2000 | 6 | 5e-6 | Half the network |
+| > 2000 | `None` (all) | 1e-6 | Full fine-tune, very low LR |
+
+The encoder LR is always `args.lr × 0.1`. So `--lr 1e-4` gives encoder params `1e-5`.
+
+---
+
+### 24.10 `load_pretrained` device safety
+
+`load_pretrained()` calls `MelHuBERTModel(model_cfg)` internally, which always allocates on
+CPU. If the outer model was already moved to MPS or CUDA via `.to(device)`, the replacement
+backbone would be on CPU while the rest of the model is on the accelerator.
+
+**Fix:** capture the device from the existing backbone before replacing it:
+
+```python
+target_device = next(self.backbone.parameters()).device
+new_backbone = MelHuBERTModel(model_cfg)
+# ... load state dict ...
+self.backbone = new_backbone.to(target_device)
+```
+
+This must be done even when the model has not been moved yet (target_device = cpu in that
+case, which is safe).
+
+---
+
+### 24.11 `TransformerBranchConfig` quick reference
 
 | Field | Default | Description |
 |---|---|---|
 | `ckpt_path` | `None` | Path to `.ckpt`; `None` = from-scratch |
 | `freeze_encoder` | `True` | Freeze backbone at init |
-| `unfreeze_after_steps` | `1000` | Hint for training loop |
-| `input_mel_bins` | `80` | Bins in your mel tensor |
-| `melhubert_feat_dim` | `80` | Must match ckpt `feat_emb_dim` |
+| `input_mel_bins` | `80` | Bins in input mel tensor |
+| `melhubert_feat_dim` | `80` | Must match ckpt `feat_emb_dim` (80 for 20ms) |
 | `use_frame_stacking` | `False` | Stack pairs of 40-bin frames → 80 dim |
 | `sparc_channels` | `0` | EMA position channels to concat onto mel |
-| `sparse_keys` | `[]` | Scalar keys for cross-attention conditioning |
-| `sparse_dim` | `64` | Dimension of sparse conditioning vector |
-| `embed_dim` | `768` | Output dimension (768 = Base) |
-| `n_encoder_layers` | `2` | Layers for from-scratch mode only |
+| `sparse_keys` | `[]` | Scalar feature keys for FiLM conditioning |
+| `sparse_dim` | `64` | Dimension of FiLM conditioning vector |
+| `embed_dim` | `768` | Encoder hidden dimension (768 = Base) |
+| `n_encoder_layers` | `2` | Used only for from-scratch mode |
 | `pool` | `"mean"` | `"mean"` or `"weighted_sum"` |
 
-### Usage example (fine-tuning from checkpoint with EMA + jerk conditioning)
+---
 
-```python
-from aces_b2ai.models.model_config import DiagnosisModelConfig, TransformerBranchConfig
-from aces_b2ai.models.fusion_model import FusionModel
-import torch
+### 24.12 Training CLI reference
 
-cfg = DiagnosisModelConfig(
-    enable_scalar_branch=False,
-    enable_transformer_branch=True,
-    transformer=TransformerBranchConfig(
-        ckpt_path="weights/melhubert-20ms-stg2.ckpt",
-        freeze_encoder=True,           # unfreeze after warmup
-        unfreeze_after_steps=500,
-        melhubert_feat_dim=80,
-        sparc_channels=12,             # EMA positions (50 Hz, 12 channels)
-        sparse_keys=["jerk_tbx", "jerk_tby", "f0_mean", "hnr_mean"],
-        sparse_dim=64,
-        embed_dim=768,
-    ),
-    n_classes_multiclass=7,
-)
-model = FusionModel(cfg)
+Script: `scripts/train_binary_classifier.py`
 
-# Optimizer with LR scaling: encoder 0.1× base, everything else 1×
-opt = torch.optim.AdamW(model.get_param_groups(base_lr=1e-4))
+**Key arguments:**
 
-# Training step
-batch = {
-    "mel": torch.randn(8, 80, 200),          # mel spectrogram
-    "sparc_series": torch.randn(8, 12, 200), # EMA positions at 50 Hz
-    "sparse_vector": torch.randn(8, 64),     # jerk/F0/HNR scalars
-}
-out = model(batch)
+| Argument | Default | Description |
+|---|---|---|
+| `--target` | required | Condition name, e.g. `hearing_cochlear` |
+| `--feature-mode` | `mlp` | `mlp`, `tcn`, or `melhubert` |
+| `--negative-class` | `all` | `all` or `healthy_only` |
+| `--exclude-ill` | off | Exclude participants ill at recording |
+| `--tasks` | all | Filter to specific task names, e.g. `long-sounds` |
+| `--ckpt-path` | `weights/melhubert-20ms-stg2.ckpt` | Checkpoint path |
+| `--sparse-keys` | 7 defaults | Keys for FiLM conditioning; `''` to disable |
+| `--unfreeze-after` | `None` | Epoch to begin partial unfreezing |
+| `--unfreeze-top-n` | `None` | Number of top encoder layers to unfreeze |
+| `--patience` | `None` | Early stopping patience (epochs without val AUC gain) |
+| `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `mps` |
+| `--lr` | `1e-3` | Base LR (encoder gets `0.1×` after unfreeze) |
+| `--batch-size` | `16` | Batch size |
+| `--epochs` | `10` | Max epochs |
+
+**Recommended cluster command (hearing_cochlear):**
+
+```bash
+python scripts/train_binary_classifier.py \
+    --target hearing_cochlear \
+    --negative-class healthy_only \
+    --feature-mode melhubert \
+    --ckpt-path weights/melhubert-20ms-stg2.ckpt \
+    --exclude-ill \
+    --tasks long-sounds \
+    --epochs 40 \
+    --batch-size 16 \
+    --lr 1e-4 \
+    --patience 8 \
+    --unfreeze-after 5 \
+    --unfreeze-top-n 3 \
+    --log-every 5 \
+    --out-dir runs/cochlear_melhubert \
+    --device cuda
 ```
 
-### Known pitfalls (all addressed in implementation)
+---
 
-1. **PyTorch ≥ 2.6 `weights_only` default** — checkpoint stores `argparse.Namespace`; 
+### 24.13 Known pitfalls (all addressed)
+
+1. **PyTorch ≥ 2.6 `weights_only` default** — checkpoint stores `argparse.Namespace`;
    fixed with `torch.serialization.add_safe_globals([argparse.Namespace])` + `weights_only=False`.
-2. **`pre_extract_proj` shape mismatch** — two-mode design described above.
-3. **`n_encoder_layers` override** — only applies to from-scratch; `load_pretrained()` always
-   uses the full 12-layer architecture from the checkpoint.
+
+2. **`pre_extract_proj` shape mismatch** — two-mode design (§24.4).
+
+3. **`n_encoder_layers` override** — `load_pretrained()` always reconstructs 12 layers from
+   the checkpoint's own stored config; `cfg.n_encoder_layers` is ignored.
+
 4. **EMA frame rate** — `MelSPARCAugmentation` uses `F.interpolate(mode="nearest")` to
-   resample sparc to match stacked mel length automatically (50→50 Hz no-op; 50→100 Hz 2×).
-5. **`final_proj` unused** — present in checkpoint and backbone but never called when
-   `no_pred=True`.  Grad is `None` for this layer; the smoke tests check encoder *layer*
-   params specifically.
-6. **1.0 GB checkpoint** — added `weights/*.ckpt` to `.gitignore`; moved to `weights/` subdir.
+   resample sparc to match stacked mel length automatically.
+
+5. **Backbone on CPU after `.to(device)`** — `load_pretrained()` detects current device
+   and moves the rebuilt backbone there (§24.10).
+
+6. **`speaking_rate` NaN rows** — 4 rows in `static_features.tsv` have missing speaking_rate.
+   `pd.isna()` guard in `_make_mel_rows()`; `torch.nan_to_num` in `SparseConditionedLayer`.
+
+7. **HNR outliers** — `HNRdBACF_sma3nz_stddevNorm` ranges from −1812 to +624 raw.
+   z-scored and clamped to `[-5, 5]` before the model.
+
+8. **MHA → FiLM switch** — `SparseConditionedLayer` originally used `nn.MultiheadAttention`
+   (2.36M params). With 91 clips this caused immediate memorisation and NaN-level gradient
+   spikes (GNorm ~35). Replaced with FiLM (§24.5); 14,593 total trainable params.
+
+9. **`final_proj` unused** — in checkpoint and backbone but never called when `no_pred=True`.
+   Grad is `None`; smoke tests check encoder layer params specifically.
+
+10. **1.0 GB checkpoint** — added `weights/*.ckpt` to `.gitignore`; stored in `weights/` subdir.

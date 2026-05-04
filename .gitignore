@@ -51,6 +51,10 @@ bridge2ai-voice-pediatric-dataset-1.0.0
 # ======================
 weights/*.ckpt
 *.ckpt
+*.pt
 
-hubert_full_conversation.md
-hubert-finetuning-for-audio-classification.ipynb
+# ======================
+# TRAINING RUN ARTIFACTS
+# Checkpoints, metrics CSVs, logs — never commit
+# ======================
+runs/
