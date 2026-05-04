@@ -11,6 +11,8 @@
 data/
 features/
 phenotype/
+adult/
+ssast/
 *.parquet
 *.wav
 *.mp3
