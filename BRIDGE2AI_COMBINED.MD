@@ -1077,3 +1077,139 @@ From analysis outputs, known confounds to control in formal models:
 - **Secondary feature library:** implement from Section 22 architecture; unit-test with synthetic signals from Section 22 test cases before running on real data.
 - **Pediatric normalization:** build healthy-control reference models (Section 23 point 4) once sufficient healthy control data is confirmed in the dataset.
 - **Single source for feature definitions:** treat this file as master; update Section 18 when secondary feature library is finalized.
+
+---
+
+## Section 24 — MelHuBERT TransformerBranch
+
+### Vendored source
+
+The MelHuBERT model source is vendored at:
+
+    src/aces_b2ai/models/melhubert_vendor/
+
+This folder contains `model.py`, `module.py`, `fairseq_code/`, and `pytorch_code/`
+copied from [nervjack2/MelHuBERT](https://github.com/nervjack2/MelHuBERT) (ASRU 2023, MIT License).
+The only modifications are import-path fixes (bare module names → relative imports) so the
+sub-package works inside `aces_b2ai`.
+
+Import paths:
+
+```python
+from aces_b2ai.models.melhubert_vendor import MelHuBERTModel, MelHuBERTConfig
+from aces_b2ai.models.branches import TransformerBranch
+from aces_b2ai.models.model_config import TransformerBranchConfig
+```
+
+### Checkpoint
+
+The pretrained checkpoint is stored at `weights/melhubert-20ms-stg2.ckpt` (1.0 GB, gitignored).
+It was inspected at plan time and has the following properties:
+
+| Property | Value |
+|---|---|
+| Training step | 582,000 (stage 2, fully trained) |
+| `feat_emb_dim` | 80 (two 40-bin fbank frames stacked, 20 ms period) |
+| `encoder_layers` | 12 |
+| `encoder_embed_dim` | 768 |
+| `encoder_attention_heads` | 12 |
+| State dict tensors | 201 |
+
+Additional pretrained checkpoints from the original repo:
+
+| Name | `feat_emb_dim` | Link |
+|---|---|---|
+| MelHuBERT-20ms 360h stage 2 *(this file)* | 80 | https://drive.google.com/file/d/11wzYf8u9pXPvQyQU2Wodx79W31Ka2e0Z/view |
+| MelHuBERT-10ms 360h stage 1 | 40 | https://drive.google.com/file/d/1YZP9nBSRaQ_Z2cFaFLmLkGilEYsEHb2b/view |
+| MelHuBERT-20ms 960h stage 2 | 80 | https://drive.google.com/file/d/1Fn_C5VoH5iV3LdvBEjvfAsbMPhWFFPdd/view |
+| MelHuBERT-10ms 960h stage 2 | 40 | https://drive.google.com/file/d/18u2u-528uDh5T7R1bp1wvWJ2ygcrNlzx/view |
+
+### SPARC augmentation failure mode and fix
+
+The checkpoint's `pre_extract_proj` maps exactly `80 → 768`.  Adding EMA position
+channels changes the input to `80+S`, which breaks `load_state_dict(strict=True)`.
+
+**Two-mode design** (controlled by `sparc_channels`):
+
+| Mode | `sparc_channels` | Backbone `feat_emb_dim` | `pre_extract_proj` | Load mode |
+|---|---|---|---|---|
+| Clean | 0 | 80 (matches ckpt) | `Linear(80→768)` from ckpt | `strict=True` |
+| SPARC-augmented | >0 | 768 (= embed_dim) | `None` (skipped by backbone) | `strict=False` |
+
+In the SPARC-augmented mode, `TransformerBranch.input_proj = Linear(80+S → 768)` is added
+externally and trained from scratch.  On load, `pre_extract_proj.*` (2 tensors) are silently
+skipped; all 12 encoder transformer layers load correctly (199/201 tensors).
+
+**Use EMA positions, not jerk time-series, for SPARC augmentation.**  Jerk is the 3rd
+derivative of EMA position; each differentiation amplifies noise.  At 50 Hz the SNR of raw
+jerk is too low for frame-level augmentation.  Instead:
+
+- `sparc_channels=12` — EMA position channels (smooth, clinically meaningful)
+- `sparse_keys=["jerk_tbx", "jerk_tby", ...]` — jerk *scalars* via cross-attention conditioning
+
+### `TransformerBranchConfig` quick reference
+
+| Field | Default | Description |
+|---|---|---|
+| `ckpt_path` | `None` | Path to `.ckpt`; `None` = from-scratch |
+| `freeze_encoder` | `True` | Freeze backbone at init |
+| `unfreeze_after_steps` | `1000` | Hint for training loop |
+| `input_mel_bins` | `80` | Bins in your mel tensor |
+| `melhubert_feat_dim` | `80` | Must match ckpt `feat_emb_dim` |
+| `use_frame_stacking` | `False` | Stack pairs of 40-bin frames → 80 dim |
+| `sparc_channels` | `0` | EMA position channels to concat onto mel |
+| `sparse_keys` | `[]` | Scalar keys for cross-attention conditioning |
+| `sparse_dim` | `64` | Dimension of sparse conditioning vector |
+| `embed_dim` | `768` | Output dimension (768 = Base) |
+| `n_encoder_layers` | `2` | Layers for from-scratch mode only |
+| `pool` | `"mean"` | `"mean"` or `"weighted_sum"` |
+
+### Usage example (fine-tuning from checkpoint with EMA + jerk conditioning)
+
+```python
+from aces_b2ai.models.model_config import DiagnosisModelConfig, TransformerBranchConfig
+from aces_b2ai.models.fusion_model import FusionModel
+import torch
+
+cfg = DiagnosisModelConfig(
+    enable_scalar_branch=False,
+    enable_transformer_branch=True,
+    transformer=TransformerBranchConfig(
+        ckpt_path="weights/melhubert-20ms-stg2.ckpt",
+        freeze_encoder=True,           # unfreeze after warmup
+        unfreeze_after_steps=500,
+        melhubert_feat_dim=80,
+        sparc_channels=12,             # EMA positions (50 Hz, 12 channels)
+        sparse_keys=["jerk_tbx", "jerk_tby", "f0_mean", "hnr_mean"],
+        sparse_dim=64,
+        embed_dim=768,
+    ),
+    n_classes_multiclass=7,
+)
+model = FusionModel(cfg)
+
+# Optimizer with LR scaling: encoder 0.1× base, everything else 1×
+opt = torch.optim.AdamW(model.get_param_groups(base_lr=1e-4))
+
+# Training step
+batch = {
+    "mel": torch.randn(8, 80, 200),          # mel spectrogram
+    "sparc_series": torch.randn(8, 12, 200), # EMA positions at 50 Hz
+    "sparse_vector": torch.randn(8, 64),     # jerk/F0/HNR scalars
+}
+out = model(batch)
+```
+
+### Known pitfalls (all addressed in implementation)
+
+1. **PyTorch ≥ 2.6 `weights_only` default** — checkpoint stores `argparse.Namespace`; 
+   fixed with `torch.serialization.add_safe_globals([argparse.Namespace])` + `weights_only=False`.
+2. **`pre_extract_proj` shape mismatch** — two-mode design described above.
+3. **`n_encoder_layers` override** — only applies to from-scratch; `load_pretrained()` always
+   uses the full 12-layer architecture from the checkpoint.
+4. **EMA frame rate** — `MelSPARCAugmentation` uses `F.interpolate(mode="nearest")` to
+   resample sparc to match stacked mel length automatically (50→50 Hz no-op; 50→100 Hz 2×).
+5. **`final_proj` unused** — present in checkpoint and backbone but never called when
+   `no_pred=True`.  Grad is `None` for this layer; the smoke tests check encoder *layer*
+   params specifically.
+6. **1.0 GB checkpoint** — added `weights/*.ckpt` to `.gitignore`; moved to `weights/` subdir.

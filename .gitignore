@@ -44,3 +44,13 @@ env/
 
 .gitignore
 bridge2ai-voice-pediatric-dataset-1.0.0
+
+# ======================
+# MODEL CHECKPOINTS
+# Large binary files — never commit
+# ======================
+weights/*.ckpt
+*.ckpt
+
+hubert_full_conversation.md
+hubert-finetuning-for-audio-classification.ipynb
