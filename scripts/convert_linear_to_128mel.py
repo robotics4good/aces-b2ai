@@ -64,7 +64,12 @@ def process_adult_dataset(input_path, output_path):
     # Process each recording
     adult_mel_rows = []
     for idx, row in tqdm(adult_df.iterrows(), total=len(adult_df), desc="Converting adult"):
-        linear_spec = np.array(row['spectrogram'], dtype=np.float32)  # [201, T]
+        # Handle parquet array of arrays
+        spec_data = row['spectrogram']
+        if isinstance(spec_data, np.ndarray) and spec_data.dtype == object:
+            linear_spec = np.stack(spec_data).astype(np.float32)  # [201, T]
+        else:
+            linear_spec = np.array(spec_data, dtype=np.float32)  # [201, T]
 
         # Subsample time axis: 100Hz → 50Hz to match pediatric
         linear_spec = linear_spec[:, ::2]
@@ -103,7 +108,12 @@ def process_pediatric_dataset(input_path, output_path):
     # Process each recording
     ped_mel_rows = []
     for idx, row in tqdm(ped_df.iterrows(), total=len(ped_df), desc="Converting pediatric"):
-        linear_spec = np.array(row['torchaudio_spectrogram'], dtype=np.float32)  # [201, T]
+        # Handle parquet array of arrays
+        spec_data = row['spectrogram']
+        if isinstance(spec_data, np.ndarray) and spec_data.dtype == object:
+            linear_spec = np.stack(spec_data).astype(np.float32)  # [201, T]
+        else:
+            linear_spec = np.array(spec_data, dtype=np.float32)  # [201, T]
 
         # No time subsampling needed (already 50Hz)
         mel_spec = convert_linear_to_mel(linear_spec, n_mels=128)

@@ -94,7 +94,7 @@ def main():
 
     for new_col, orig_col in binary_fields.items():
         if orig_col in df.columns:
-            expanded_df[new_col] = (df[orig_col] == 'yes').astype(int)
+            expanded_df[new_col] = (df[orig_col].str.lower() == 'yes').astype(int)
         else:
             print(f"⚠️  Warning: Binary field '{orig_col}' not found, skipping")
 

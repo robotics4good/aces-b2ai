@@ -51,5 +51,26 @@ entropy_flow/entropy.ipynb
 # ======================
 .DS_Store
 
-.gitignore
+# ======================
+# TRAINING OUTPUTS
+# ======================
+# Log files from data preprocessing
+*.log
+
+# Model checkpoints and training results
+results/
+*.pth
+
+# Normalization statistics
+*.npy
+
+# Training curves and plots
+*.png
+*.pdf
+
+# Except documentation images
+!docs/**/*.png
+!docs/**/*.pdf
+
+# Legacy dataset reference
 bridge2ai-voice-pediatric-dataset-1.0.0

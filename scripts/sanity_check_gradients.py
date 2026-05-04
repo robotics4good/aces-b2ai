@@ -42,7 +42,7 @@ def run_gradient_verification(dataset, dataset_type):
 
     # Initialize model with pretrained weights
     model = ASTModel(
-        label_dim=5,  # 5 overlapping conditions
+        label_dim=8,  # 8 overlapping conditions
         fshape=128,   # full frequency axis (frame-based)
         tshape=2,
         fstride=128,  # no overlap

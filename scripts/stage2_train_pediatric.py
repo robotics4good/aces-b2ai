@@ -155,8 +155,15 @@ def main():
     parser.add_argument('--output-dir', type=str, default='results/stage2_pediatric', help='Output directory')
     parser.add_argument('--val-split', type=float, default=0.15, help='Validation split ratio')
     parser.add_argument('--test-split', type=float, default=0.15, help='Test split ratio')
+    parser.add_argument('--age-min', type=int, default=None, help='Minimum age for filtering (optional)')
+    parser.add_argument('--age-max', type=int, default=None, help='Maximum age for filtering (optional)')
 
     args = parser.parse_args()
+
+    # Parse age range
+    age_range = None
+    if args.age_min is not None and args.age_max is not None:
+        age_range = (args.age_min, args.age_max)
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -190,6 +197,7 @@ def main():
         normalize=True,
         mean=mean,
         std=std,
+        age_range=age_range,
     )
 
     # Get unique participant IDs for stratified splitting
@@ -218,6 +226,7 @@ def main():
         mean=mean,
         std=std,
         participant_ids=train_pids,
+        age_range=age_range,
     )
 
     val_dataset = PediatricBridge2AIDataset(
@@ -229,6 +238,7 @@ def main():
         mean=mean,
         std=std,
         participant_ids=val_pids,
+        age_range=age_range,
     )
 
     test_dataset = PediatricBridge2AIDataset(
@@ -240,6 +250,7 @@ def main():
         mean=mean,
         std=std,
         participant_ids=test_pids,
+        age_range=age_range,
     )
 
     print(f"Train recordings: {len(train_dataset)}")

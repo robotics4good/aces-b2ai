@@ -151,8 +151,15 @@ def main():
     parser.add_argument('--output-dir', type=str, default='results/stage1_adult', help='Output directory')
     parser.add_argument('--val-split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--condition-mapping-file', type=str, help='Path to condition mapping JSON (optional)')
+    parser.add_argument('--age-min', type=int, default=None, help='Minimum age for filtering (optional)')
+    parser.add_argument('--age-max', type=int, default=None, help='Maximum age for filtering (optional)')
 
     args = parser.parse_args()
+
+    # Parse age range
+    age_range = None
+    if args.age_min is not None and args.age_max is not None:
+        age_range = (args.age_min, args.age_max)
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -186,6 +193,7 @@ def main():
         normalize=True,
         mean=mean,
         std=std,
+        age_range=age_range,
     )
 
     # Train/val split

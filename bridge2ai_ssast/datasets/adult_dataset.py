@@ -25,6 +25,7 @@ class AdultBridge2AIDataset(Dataset):
         mean: Global mean for normalization (compute via scripts/compute_mel128_normalization.py)
         std: Global std for normalization
         tasks: Optional list of task names to filter (e.g., ['passage', 'sentence'])
+        age_range: Optional tuple (min_age, max_age) to filter by age (e.g., (30, 50) for middle-aged adults)
     """
 
     def __init__(
@@ -37,16 +38,33 @@ class AdultBridge2AIDataset(Dataset):
         mean=None,
         std=None,
         tasks=None,
+        age_range=None,
     ):
         # Load mel spectrograms
         self.mels = pq.read_table(mel_parquet_path).to_pandas()
 
+        # Load phenotype data (need it for age filtering)
+        self.phenotype = pd.read_csv(phenotype_path, sep='\t', low_memory=False)
+
+        # Filter by age range if specified
+        if age_range is not None:
+            min_age, max_age = age_range
+            age_filtered = self.phenotype[
+                (self.phenotype['age'] >= min_age) &
+                (self.phenotype['age'] <= max_age)
+            ]
+            valid_participant_sessions = list(
+                zip(age_filtered['participant_id'], age_filtered['session_id'])
+            )
+            # Create a merged key for filtering
+            self.mels['_key'] = list(zip(self.mels['participant_id'], self.mels['session_id']))
+            self.mels = self.mels[self.mels['_key'].isin(valid_participant_sessions)]
+            self.mels = self.mels.drop(columns=['_key'])
+            print(f"Age filter ({min_age}-{max_age}): {len(age_filtered)} participants/sessions")
+
         # Filter by tasks if specified
         if tasks is not None:
             self.mels = self.mels[self.mels['task_name'].isin(tasks)]
-
-        # Load phenotype data
-        self.phenotype = pd.read_csv(phenotype_path, sep='\t', low_memory=False)
 
         # Merge on participant_id and session_id
         self.data = self.mels.merge(

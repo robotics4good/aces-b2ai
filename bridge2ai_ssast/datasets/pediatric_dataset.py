@@ -29,6 +29,8 @@ class PediatricBridge2AIDataset(Dataset):
         std: Global std for normalization
         tasks: Optional list of task names to filter (e.g., ['long-sounds', 'passage'])
         participant_ids: Optional list of participant IDs to filter (for train/val/test splits)
+        age_range: Optional tuple (min_age, max_age) to filter by age (e.g., (7, 12) for elementary ages)
+        demographics_path: Path to pediatric demographics TSV (required if age_range is specified)
     """
 
     def __init__(
@@ -42,9 +44,23 @@ class PediatricBridge2AIDataset(Dataset):
         std=None,
         tasks=None,
         participant_ids=None,
+        age_range=None,
+        demographics_path='phenotype/pediatric/pediatric_demographics.tsv',
     ):
         # Load mel spectrograms
         self.mels = pq.read_table(mel_parquet_path).to_pandas()
+
+        # Filter by age range if specified
+        if age_range is not None:
+            demographics = pd.read_csv(demographics_path, sep='\t')
+            min_age, max_age = age_range
+            age_filtered = demographics[
+                (demographics['age'] >= min_age) &
+                (demographics['age'] <= max_age)
+            ]
+            valid_participants = age_filtered['participant_id'].tolist()
+            self.mels = self.mels[self.mels['participant_id'].isin(valid_participants)]
+            print(f"Age filter ({min_age}-{max_age}): {len(valid_participants)} participants")
 
         # Filter by tasks if specified
         if tasks is not None:

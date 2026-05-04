@@ -1,0 +1,88 @@
+{
+  "adult_to_pediatric_mapping": {
+    "asthma": {
+      "adult_column": "asthma",
+      "adult_column_number": 35,
+      "pediatric_column": "has_asthma",
+      "description": "Asthma diagnosis",
+      "adult_prevalence": "10.0%",
+      "pediatric_prevalence": "10.8%"
+    },
+    "allergies": {
+      "adult_column": "seasonal_allergies",
+      "adult_column_number": 453,
+      "pediatric_column": "had_allergies",
+      "description": "Allergies (seasonal for adult, general for pediatric)",
+      "adult_prevalence": "22.6%",
+      "pediatric_prevalence": "23.0%"
+    },
+    "hearing_loss": {
+      "adult_column": "hearing",
+      "adult_column_number": 392,
+      "pediatric_column": "has_hearing_loss",
+      "description": "Hearing loss or impairment",
+      "adult_prevalence": "8.6%",
+      "pediatric_prevalence": "21.6%"
+    },
+    "adhd": {
+      "adult_column": "add_adhd",
+      "adult_column_number": 22,
+      "pediatric_column": "has_adhd",
+      "description": "ADHD/ADD diagnosis",
+      "adult_prevalence": "2.7%",
+      "pediatric_prevalence": "9.5%"
+    },
+    "gerd_reflux": {
+      "adult_column": "diagnosis_pl_etiology___laryngopharyngeal_reflux",
+      "adult_column_number": 135,
+      "pediatric_column": "has_acid_reflux_disease",
+      "description": "GERD/LPR/acid reflux",
+      "adult_prevalence": "TBD",
+      "pediatric_prevalence": "4.3%"
+    },
+    "speech_therapy": {
+      "adult_column": "diagnosis_ld_qete___speech_language_pathology",
+      "adult_column_number": 86,
+      "pediatric_column": "had_speech_therapy",
+      "description": "Speech/language therapy history",
+      "adult_prevalence": "TBD",
+      "pediatric_prevalence": "23.6%"
+    },
+    "chronic_cough": {
+      "adult_column": "chronic_cough",
+      "adult_column_number": 37,
+      "pediatric_column": "has_chronic_cough",
+      "description": "Chronic cough diagnosis",
+      "adult_prevalence": "9.0%",
+      "pediatric_prevalence": "2.0%"
+    },
+    "depression": {
+      "adult_column": "depression",
+      "adult_column_number": 26,
+      "pediatric_column": "has_depression",
+      "description": "Depression diagnosis",
+      "adult_prevalence": "11.8%",
+      "pediatric_prevalence": "2.0%"
+    }
+  },
+  "label_order": [
+    "asthma",
+    "allergies",
+    "hearing_loss",
+    "adhd",
+    "gerd_reflux",
+    "speech_therapy",
+    "chronic_cough",
+    "depression"
+  ],
+  "notes": [
+    "8-label multi-label classification system",
+    "Adult dataset: Uses single phenotype.tsv file with binary yes/no columns",
+    "Pediatric dataset: Uses parsed multi-select fields from pediatric_conditions_expanded.tsv",
+    "Column numbers are 1-indexed as they appear in head output (participant_id is column 1)",
+    "GERD: Adult uses laryngopharyngeal reflux from voice disorder diagnosis, pediatric uses acid reflux",
+    "Speech therapy: Adult uses speech/language pathology diagnosis, pediatric uses binary therapy history",
+    "Some conditions have low prevalence in one dataset but higher in the other (e.g., hearing loss 9% adult vs 22% pediatric)",
+    "Label order must be consistent across both datasets for multi-label training"
+  ]
+}
