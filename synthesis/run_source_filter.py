@@ -23,6 +23,7 @@ def main() -> None:
         default="phase_from_excitation_linear_mag",
     )
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--is-uvfp", action="store_true", help="Enable UVFP-specific dynamics and loudness target.")
     args = p.parse_args()
 
     cfg = SourceFilterConfig()
@@ -34,6 +35,7 @@ def main() -> None:
         output_wav=args.out,
         combine_mode=args.combine_mode,
         seed=args.seed,
+        is_uvfp=args.is_uvfp,
     )
     print(out)
 

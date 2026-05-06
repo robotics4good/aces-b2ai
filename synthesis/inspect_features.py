@@ -13,7 +13,8 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_DATASET_ROOT = Path("b2ai_adult_dataset/3.0.0")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATASET_ROOT = REPO_ROOT / "b2ai_adult_dataset/3.0.0"
 DEFAULT_STATIC_TSV = DEFAULT_DATASET_ROOT / "features/static_features.tsv"
 
 
@@ -23,6 +24,11 @@ def main() -> None:
     args = p.parse_args()
 
     path: Path = args.static_tsv
+    # Make the default behave correctly regardless of where it's run from.
+    if path == DEFAULT_STATIC_TSV:
+        path = DEFAULT_STATIC_TSV
+    elif not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
     if not path.exists():
         raise SystemExit(f"File not found: {path}")
 
