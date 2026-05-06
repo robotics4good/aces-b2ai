@@ -40,3 +40,9 @@ env/
 # ======================
 .ipynb_checkpoints/
 *.ipynb_chec
+
+# ======================
+# UNTRACKED FILES
+# ======================
+untracked_files/
+adult/
