@@ -8,6 +8,7 @@
 # DATA - DUA COMPLIANCE
 # Never commit participant data
 # ======================
+/b2ai_adult_dataset/
 data/
 *.parquet
 *.wav
