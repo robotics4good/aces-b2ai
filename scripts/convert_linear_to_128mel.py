@@ -55,42 +55,74 @@ def process_adult_dataset(input_path, output_path):
     print(f"Input: {input_path}")
     print(f"Output: {output_path}")
 
-    # Load adult spectrograms
-    adult_table = pq.read_table(input_path)
-    adult_df = adult_table.to_pandas()
+    # Stream from parquet file using ParquetFile API
+    parquet_file = pq.ParquetFile(input_path)
+    total_rows = parquet_file.metadata.num_rows
+    print(f"Total rows to process: {total_rows}")
 
-    print(f"Loaded {len(adult_df)} adult spectrograms")
+    # Process in row group batches (stream, don't load all at once)
+    batch_size = 500  # Smaller batches for memory safety
+    processed_count = 0
+    batch_files = []
 
-    # Process each recording
-    adult_mel_rows = []
-    for idx, row in tqdm(adult_df.iterrows(), total=len(adult_df), desc="Converting adult"):
-        # Handle parquet array of arrays
-        spec_data = row['spectrogram']
-        if isinstance(spec_data, np.ndarray) and spec_data.dtype == object:
-            linear_spec = np.stack(spec_data).astype(np.float32)  # [201, T]
-        else:
-            linear_spec = np.array(spec_data, dtype=np.float32)  # [201, T]
+    import tempfile
+    import os
+    temp_dir = tempfile.mkdtemp(prefix="mel_conversion_")
 
-        # Subsample time axis: 100Hz → 50Hz to match pediatric
-        linear_spec = linear_spec[:, ::2]
+    try:
+        for batch_idx, batch in enumerate(parquet_file.iter_batches(batch_size=batch_size)):
+            batch_df = batch.to_pandas()
 
-        # Convert to 128-bin mel
-        mel_spec = convert_linear_to_mel(linear_spec, n_mels=128)
+            adult_mel_rows = []
+            for idx, row in tqdm(batch_df.iterrows(),
+                                total=len(batch_df),
+                                desc=f"Converting adult [{processed_count}-{processed_count+len(batch_df)}]",
+                                leave=False):
+                # Handle parquet array of arrays
+                spec_data = row['spectrogram']
+                if isinstance(spec_data, np.ndarray) and spec_data.dtype == object:
+                    linear_spec = np.stack(spec_data).astype(np.float32)  # [201, T]
+                else:
+                    linear_spec = np.array(spec_data, dtype=np.float32)  # [201, T]
 
-        adult_mel_rows.append({
-            'participant_id': row['participant_id'],
-            'session_id': row['session_id'],
-            'task_name': row['task_name'],
-            'mel_spectrogram': mel_spec.tolist(),
-            'n_frames': mel_spec.shape[1],
-        })
+                # Subsample time axis: 100Hz → 50Hz to match pediatric
+                linear_spec = linear_spec[:, ::2]
 
-    # Save to parquet
-    adult_mel_df = pd.DataFrame(adult_mel_rows)
-    adult_mel_df.to_parquet(output_path, compression='zstd')
+                # Convert to 128-bin mel
+                mel_spec = convert_linear_to_mel(linear_spec, n_mels=128)
 
-    print(f"✅ Saved {len(adult_mel_df)} mel spectrograms to {output_path}")
-    print(f"   Shape: [128, T] where T varies (median: {adult_mel_df['n_frames'].median():.0f} frames)")
+                adult_mel_rows.append({
+                    'participant_id': row['participant_id'],
+                    'session_id': row['session_id'],
+                    'task_name': row['task_name'],
+                    'mel_spectrogram': [mel_spec[i, :].tolist() for i in range(mel_spec.shape[0])],  # List of lists for PyArrow
+                    'n_frames': mel_spec.shape[1],
+                })
+
+            # Save batch to temporary parquet file
+            batch_mel_df = pd.DataFrame(adult_mel_rows)
+            batch_file = os.path.join(temp_dir, f"batch_{batch_idx:04d}.parquet")
+            batch_mel_df.to_parquet(batch_file, compression='zstd', index=False)
+            batch_files.append(batch_file)
+
+            processed_count += len(batch_mel_df)
+            print(f"  ✅ Saved batch {batch_idx} ({processed_count}/{total_rows} total) - {len(batch_mel_df)} recordings")
+
+        # Concatenate all batch files into final output
+        print(f"📦 Concatenating {len(batch_files)} batch files into {output_path}...")
+        all_tables = [pq.read_table(f) for f in batch_files]
+        import pyarrow as pa
+        final_table = pa.concat_tables(all_tables)
+        pq.write_table(final_table, output_path, compression='zstd')
+
+        print(f"✅ Saved {processed_count} mel spectrograms to {output_path}")
+
+    finally:
+        # Clean up temporary files
+        import shutil
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            print(f"🗑️  Cleaned up temporary directory")
 
 
 def process_pediatric_dataset(input_path, output_path):
@@ -122,7 +154,7 @@ def process_pediatric_dataset(input_path, output_path):
             'participant_id': row['participant_id'],
             'session_id': row['session_id'],
             'task_name': row['task_name'],
-            'mel_spectrogram': mel_spec.tolist(),
+            'mel_spectrogram': mel_spec,  # Keep as numpy array (not .tolist())
             'n_frames': mel_spec.shape[1],
         })
 

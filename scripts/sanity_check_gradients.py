@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 import matplotlib.pyplot as plt
 import numpy as np
+import json
 
 # Add ssast to path (assumes ssast folder is in repo root)
 sys.path.insert(0, 'ssast/src')
@@ -40,7 +41,7 @@ def run_gradient_verification(dataset, dataset_type):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Initialize model with pretrained weights
+    # Initialize model with pretrained SSAST weights
     model = ASTModel(
         label_dim=8,  # 8 overlapping conditions
         fshape=128,   # full frequency axis (frame-based)
@@ -177,6 +178,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Load condition mapping from JSON
+    with open('condition_mapping.json', 'r') as f:
+        mapping_data = json.load(f)
+
     # Load appropriate dataset
     if args.dataset == "adult":
         print("Loading adult dataset...")
@@ -185,13 +190,10 @@ def main():
         stats = np.load('adult_mel128_stats.npy', allow_pickle=True).item()
         mean, std = stats['mean'], stats['std']
 
-        # Example condition mapping (update with actual column names)
+        # Extract adult condition column mapping
         condition_mapping = {
-            'asthma': 'asthma',
-            'allergies': 'seasonal_allergies',
-            'hearing_loss': 'hearing_loss',
-            'voice_disorder': 'voice_disorder',
-            'neurological': 'neurological_disorder',
+            cond_name: mapping_data['adult_to_pediatric_mapping'][cond_name]['adult_column']
+            for cond_name in mapping_data['label_order']
         }
 
         dataset = AdultBridge2AIDataset(
@@ -211,13 +213,10 @@ def main():
         stats = np.load('pediatric_mel128_stats.npy', allow_pickle=True).item()
         mean, std = stats['mean'], stats['std']
 
-        # Example condition mapping (update after running parse_pediatric_conditions.py)
+        # Extract pediatric condition column mapping from JSON
         condition_mapping = {
-            'asthma': 'has_asthma',
-            'allergies': 'had_allergies',
-            'hearing_loss': 'has_hearing_loss',
-            'voice_disorder': 'has_voice_disorder',
-            'neurological': 'has_neurological_disorder',
+            cond_name: mapping_data['adult_to_pediatric_mapping'][cond_name]['pediatric_column']
+            for cond_name in mapping_data['label_order']
         }
 
         dataset = PediatricBridge2AIDataset(

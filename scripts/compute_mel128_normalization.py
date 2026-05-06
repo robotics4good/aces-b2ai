@@ -36,7 +36,16 @@ def compute_normalization_stats(parquet_path, sample_limit=None):
 
     all_values = []
     for mel in tqdm(df['mel_spectrogram'], desc="Collecting values"):
-        mel_array = np.array(mel, dtype=np.float32)  # [128, T]
+        # Handle numpy array of arrays format from parquet (128 mel bins, each is an array)
+        if isinstance(mel, np.ndarray) and mel.dtype == object:
+            # Stack the 128 arrays into a 2D array [128, T]
+            mel_array = np.stack(mel).astype(np.float32)
+        elif isinstance(mel, list):
+            # Handle list-of-lists format
+            mel_array = np.array(mel, dtype=np.float32)  # [128, T]
+        else:
+            # Handle standard numpy array format
+            mel_array = mel.astype(np.float32)
         all_values.append(mel_array.flatten())
 
     # Concatenate all values

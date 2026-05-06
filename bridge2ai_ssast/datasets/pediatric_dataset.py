@@ -73,6 +73,9 @@ class PediatricBridge2AIDataset(Dataset):
         # Load expanded condition labels
         self.conditions_df = pd.read_csv(conditions_expanded_path, sep='\t')
 
+        # Convert participant_id to string for consistent merge (mel parquet uses strings)
+        self.conditions_df['participant_id'] = self.conditions_df['participant_id'].astype(str)
+
         # Merge on participant_id
         self.data = self.mels.merge(
             self.conditions_df,
